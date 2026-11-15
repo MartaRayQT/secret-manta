@@ -411,6 +411,33 @@
     @keyframes fall { to { transform: translateY(110vh) rotate(720deg); opacity: .9; } }
 
     /* =========================================================
+       WISH LISTS (participant view)
+       ========================================================= */
+    .wish { max-width: 520px; margin-left: auto; margin-right: auto; }
+    .wish h2 { font-size: 19px; }
+    .wish-items { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
+    .wish-items li {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 12px; border-radius: 12px;
+      background: rgba(0,0,0,.25); border: 1px solid rgba(255,255,255,.08);
+    }
+    .wish-items .txt { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+    .wish-items a { color: var(--gold-soft); font-size: 13px; display: inline-block; margin-top: 2px; overflow-wrap: anywhere; }
+    .wish-items .del {
+      flex: 0 0 auto; width: 44px; height: 44px; border-radius: 10px;
+      border: 1px solid rgba(255,107,107,.35); background: transparent; color: var(--danger); font-size: 18px;
+    }
+    .wish-empty { color: var(--muted); font-size: 14px; margin: 12px 0 0; }
+    .wish-form { display: grid; gap: 8px; margin-top: 14px; }
+    .wish-form input {
+      width: 100%; font: inherit; font-size: 16px; color: var(--text);
+      background: rgba(0,0,0,.28); border: 1px solid rgba(255,255,255,.14);
+      border-radius: 12px; padding: 12px 14px; outline: none; min-height: 48px;
+    }
+    .wish-status { font-size: 13px; color: var(--muted); min-height: 20px; margin-top: 6px; }
+    .wish-status.err { color: var(--danger); }
+
+    /* =========================================================
        TOAST
        ========================================================= */
     .toast {
@@ -552,6 +579,29 @@
         <div class="icon" aria-hidden="true">🔐</div>
         <div><strong>Ten link jest tylko dla Ciebie. Nie udostępniaj go nikomu!</strong><br />Każdy, kto go otworzy, zobaczy, komu robisz prezent.</div>
       </div>
+
+      <!-- Wish lists: only shown when the database is configured and the link carries wish-list keys -->
+      <section class="panel wish" id="theirWish" hidden>
+        <h2>📜 Lista życzeń: <span id="theirName"></span></h2>
+        <p class="sub">Podpowiedzi od osoby, którą obdarowujesz — nie wie, że to Ty! 🤫</p>
+        <ul class="wish-items" id="theirItems"></ul>
+        <p class="wish-empty" id="theirEmpty" hidden>Ta osoba jeszcze nic nie dodała — zajrzyj później. 🎄</p>
+        <div class="wish-status" id="theirStatus"></div>
+        <button class="btn small" id="theirRefresh">🔄 Odśwież</button>
+      </section>
+
+      <section class="panel wish" id="myWish" hidden>
+        <h2>🎁 Moja lista życzeń</h2>
+        <p class="sub">Dopisz, co chcesz dostać — zobaczy to tylko Twój Tajny Mikołaj. Zmiany zapisują się od razu.</p>
+        <ul class="wish-items" id="myItems"></ul>
+        <p class="wish-empty" id="myEmpty" hidden>Twoja lista jest pusta. Dodaj pierwszy pomysł!</p>
+        <form class="wish-form" id="wishForm" autocomplete="off">
+          <input id="wishText" type="text" maxlength="200" placeholder="np. książka – kryminał, ciepłe skarpety (rozm. 39–42)" aria-label="Pomysł na prezent" required />
+          <input id="wishUrl" type="text" maxlength="300" placeholder="Link do sklepu (opcjonalnie)" aria-label="Link do sklepu (opcjonalnie)" inputmode="url" />
+          <button class="btn gold" type="submit" id="wishAdd">➕ Dodaj do listy</button>
+        </form>
+        <div class="wish-status" id="myStatus"></div>
+      </section>
     </main>
 
     <!-- =====================================================
@@ -589,16 +639,24 @@
     const DEFAULT_DATE = "2026-12-24";              // pre-filled exchange date (editable)
     const STORAGE_KEY = "secretSanta.kubalkowie.v1"; // locked draw + setup draft
     const MIN_PARTICIPANTS = 3;
+
+    /* Wish lists are stored in Google Firebase (Cloud Firestore).
+       Paste your Firebase project ID here; leave empty to turn wish lists off. */
+    const FIREBASE_PROJECT_ID = "kubalki-secret-santa";
+    const WISHLISTS_ENABLED = FIREBASE_PROJECT_ID !== "";
+    const MAX_WISHES = 20;
     const $ = (sel) => document.querySelector(sel);
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-    /** Polish plural for "osoba": 1 osoba, 2–4 osoby, 5+ osób (12–14 osób). */
-    function osoby(n) {
-      if (n === 1) return "1 osoba";
+    /** Polish plural: 1 osoba, 2–4 osoby, 5+ osób (12–14 osób). */
+    function plural(n, one, few, many) {
+      if (n === 1) return `1 ${one}`;
       const d = n % 10, t = n % 100;
-      return `${n} ${d >= 2 && d <= 4 && (t < 12 || t > 14) ? "osoby" : "osób"}`;
+      return `${n} ${d >= 2 && d <= 4 && (t < 12 || t > 14) ? few : many}`;
     }
+    const osoby = (n) => plural(n, "osoba", "osoby", "osób");
+    const pozycje = (n) => plural(n, "pozycja", "pozycje", "pozycji");
 
     /** Cryptographically strong random integer in [0, max). */
     function randInt(max) {
@@ -866,10 +924,17 @@
       const date = $("#exchangeDate").value;
       const drawId = bytesToB64url(crypto.getRandomValues(new Uint8Array(6)));
 
+      // Each person gets a secret, unguessable wish-list key. Their link carries
+      // their own key (to edit their list) and their recipient's key (to read it).
+      const wishKeys = names.map(() => bytesToB64url(crypto.getRandomValues(new Uint8Array(16))));
+
       // Only the sealed tokens are stored — pairings are decoded only on request.
       const participants = names.map((giver, i) => ({
         name: giver,
-        token: encodePayload({ v: 1, d: drawId, g: giver, r: names[perm[i]], e: EVENT_NAME, x: date }),
+        token: encodePayload({
+          v: 1, d: drawId, g: giver, r: names[perm[i]], e: EVENT_NAME, x: date,
+          k: wishKeys[i], q: wishKeys[perm[i]],
+        }),
       }));
 
       const state = { locked: true, drawId, drawnAt: new Date().toISOString(), date, participants };
@@ -941,7 +1006,9 @@
       if (state.date) lines.push(`📅 Wymiana prezentów: ${formatDate(state.date)}`);
       lines.push(
         ``,
-        `Otwórz swój prywatny link i sprawdź, komu robisz prezent:`,
+        WISHLISTS_ENABLED
+          ? `Otwórz swój prywatny link, sprawdź, komu robisz prezent, i dopisz swoją listę życzeń 📝:`
+          : `Otwórz swój prywatny link i sprawdź, komu robisz prezent:`,
         linkFor(p.token),
         ``,
         `🤫 Ten link jest tylko dla Ciebie — nie udostępniaj go nikomu!`
@@ -961,13 +1028,30 @@
       $("#plist").innerHTML = state.participants.map((p, i) => `
         <li class="pitem">
           <div class="avatar" aria-hidden="true">${escapeHtml(initials(p.name))}</div>
-          <div class="pname">${escapeHtml(p.name)}<small>Prywatny link gotowy</small></div>
+          <div class="pname">${escapeHtml(p.name)}<small data-wish="${i}">Prywatny link gotowy</small></div>
           <div class="pactions">
             <button class="btn small" data-act="link" data-i="${i}">🔗 Kopiuj link</button>
             <button class="btn small gold" data-act="msg" data-i="${i}">💬 Kopiuj wiadomość</button>
             ${navigator.share ? `<button class="btn small" data-act="share" data-i="${i}" aria-label="Udostępnij link dla: ${escapeHtml(p.name)}">📤</button>` : ""}
           </div>
         </li>`).join("");
+
+      loadWishCounts(state);
+    }
+
+    /** Show how many items each person has on their wish list (counts only, never contents). */
+    async function loadWishCounts(state) {
+      if (!WISHLISTS_ENABLED) return;
+      await Promise.all(state.participants.map(async (p, i) => {
+        const el = document.querySelector(`[data-wish="${i}"]`);
+        let key;
+        try { key = decodePayload(p.token).k; } catch { return; }
+        if (!key || !el) return;
+        try {
+          const n = (await fetchWishes(key)).length;
+          el.textContent = n ? `📝 Lista życzeń: ${pozycje(n)}` : "📝 Lista życzeń: jeszcze pusta";
+        } catch { /* offline: keep the default label */ }
+      }));
     }
 
     // One delegated handler for all per-participant buttons
@@ -1064,6 +1148,8 @@
 
       $("#flipCard").classList.remove("revealed");
       $("#hideAgain").hidden = true;
+
+      initWishlists(data);
     }
 
     $("#flipCard").addEventListener("click", () => {
@@ -1072,7 +1158,11 @@
       card.classList.add("revealed");
       card.setAttribute("aria-label", "Wynik losowania został odkryty");
       setTimeout(() => burstConfetti(90), reducedMotion ? 0 : 550);
-      setTimeout(() => ($("#hideAgain").hidden = false), 900);
+      setTimeout(() => {
+        $("#hideAgain").hidden = false;
+        // The recipient's list names them, so it only appears after the reveal
+        if (wish.theirKey) $("#theirWish").hidden = false;
+      }, 900);
     });
 
     $("#hideAgain").addEventListener("click", () => {
@@ -1080,6 +1170,171 @@
       card.classList.remove("revealed");
       card.setAttribute("aria-label", "Odkryj mój wynik losowania");
       $("#hideAgain").hidden = true;
+      $("#theirWish").hidden = true;
+    });
+
+    /* =========================================================
+       WISH LISTS (Cloud Firestore via its REST API — no SDK)
+       ---------------------------------------------------------
+       Each list is one document: wishlists/{secretKey}. The key
+       is random and only travels inside the magic links: your
+       own link holds your key (edit), your Santa's link holds it
+       too (read). Security rules forbid listing documents, so a
+       list can't be found without its key.
+       ========================================================= */
+    const wish = { myKey: null, theirKey: null, mine: [], busy: false };
+
+    const wishUrl = (key) =>
+      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/wishlists/${key}`;
+
+    /** fetch() with a couple of quick retries for brief network or server hiccups. */
+    async function firestoreFetch(url, opts = {}) {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const res = await fetch(url, { cache: "no-store", ...opts });
+          if (res.ok || res.status === 404 || attempt >= 2) return res;
+        } catch (err) {
+          if (attempt >= 2) throw err;
+        }
+        await sleep(400 * (attempt + 1));
+      }
+    }
+
+    /** Read a wish list; a list that doesn't exist yet is simply empty. */
+    async function fetchWishes(key) {
+      const res = await firestoreFetch(wishUrl(key));
+      if (res.status === 404) return [];
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const doc = await res.json();
+      const values = doc.fields?.items?.arrayValue?.values || [];
+      return values.map((v) => ({
+        t: v.mapValue?.fields?.t?.stringValue || "",
+        u: v.mapValue?.fields?.u?.stringValue || "",
+      })).filter((it) => it.t);
+    }
+
+    /** Replace the whole list (creates the document on first save). */
+    async function saveWishes(key, items) {
+      const body = {
+        fields: {
+          items: { arrayValue: { values: items.map((it) => ({ mapValue: { fields: { t: { stringValue: it.t }, u: { stringValue: it.u } } } })) } },
+          updatedAt: { timestampValue: new Date().toISOString() },
+        },
+      };
+      const res = await firestoreFetch(wishUrl(key), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    }
+
+    /** Accept "www.shop.pl/x" as well as full links; reject anything that isn't http(s). */
+    function normalizeUrl(raw) {
+      const s = raw.trim();
+      if (!s) return "";
+      try {
+        const url = new URL(/^[a-z]+:\/\//i.test(s) ? s : `https://${s}`);
+        return /^https?:$/.test(url.protocol) && url.hostname.includes(".") ? url.href : null;
+      } catch { return null; }
+    }
+
+    function renderWishItems(ul, emptyEl, items, editable) {
+      ul.innerHTML = items.map((it, i) => {
+        const href = normalizeUrl(it.u);
+        return `<li>
+          <div class="txt">${escapeHtml(it.t)}${href ? `<br><a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">🔗 ${escapeHtml(new URL(href).hostname)}</a>` : ""}</div>
+          ${editable ? `<button class="del" data-del="${i}" aria-label="Usuń: ${escapeHtml(it.t)}">✕</button>` : ""}
+        </li>`;
+      }).join("");
+      emptyEl.hidden = items.length > 0;
+    }
+
+    function wishStatus(el, msg, isErr = false) {
+      el.textContent = msg;
+      el.classList.toggle("err", isErr);
+    }
+    const OFFLINE_MSG = "Nie udało się połączyć z listami życzeń. Sprawdź internet i spróbuj ponownie.";
+
+    function initWishlists(data) {
+      wish.myKey = WISHLISTS_ENABLED ? data.k || null : null;
+      wish.theirKey = WISHLISTS_ENABLED ? data.q || null : null;
+      $("#myWish").hidden = !wish.myKey;
+      $("#theirWish").hidden = true; // shown after the card is revealed
+      $("#theirName").textContent = data.r;
+      $("#wishText").value = "";
+      $("#wishUrl").value = "";
+      $("#myItems").innerHTML = $("#theirItems").innerHTML = "";
+      $("#myEmpty").hidden = $("#theirEmpty").hidden = true;
+      if (wish.myKey) loadMine();
+      if (wish.theirKey) loadTheirs();
+    }
+
+    async function loadMine() {
+      wishStatus($("#myStatus"), "Wczytywanie…");
+      try {
+        wish.mine = await fetchWishes(wish.myKey);
+        renderWishItems($("#myItems"), $("#myEmpty"), wish.mine, true);
+        wishStatus($("#myStatus"), "");
+      } catch {
+        wishStatus($("#myStatus"), OFFLINE_MSG, true);
+      }
+    }
+
+    async function loadTheirs() {
+      wishStatus($("#theirStatus"), "Wczytywanie…");
+      try {
+        const items = await fetchWishes(wish.theirKey);
+        renderWishItems($("#theirItems"), $("#theirEmpty"), items, false);
+        wishStatus($("#theirStatus"), "");
+      } catch {
+        wishStatus($("#theirStatus"), OFFLINE_MSG, true);
+      }
+    }
+    $("#theirRefresh").addEventListener("click", loadTheirs);
+
+    /** Re-read the latest list first (it may have been edited on another device), apply the change, save. */
+    async function updateMine(change, okMsg) {
+      if (wish.busy) return false;
+      wish.busy = true;
+      $("#wishAdd").disabled = true;
+      wishStatus($("#myStatus"), "Zapisywanie…");
+      try {
+        const next = change(await fetchWishes(wish.myKey));
+        if (!next) return false;
+        await saveWishes(wish.myKey, next);
+        wish.mine = next;
+        renderWishItems($("#myItems"), $("#myEmpty"), wish.mine, true);
+        wishStatus($("#myStatus"), okMsg);
+        return true;
+      } catch {
+        wishStatus($("#myStatus"), "Nie udało się zapisać. Sprawdź internet i spróbuj ponownie.", true);
+        return false;
+      } finally {
+        wish.busy = false;
+        $("#wishAdd").disabled = false;
+      }
+    }
+
+    $("#wishForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const t = $("#wishText").value.trim().slice(0, 200);
+      const u = normalizeUrl($("#wishUrl").value);
+      if (!t) return;
+      if (u === null) { wishStatus($("#myStatus"), "Ten link wygląda na niepoprawny — sprawdź go albo zostaw pole puste.", true); return; }
+      const ok = await updateMine((items) => {
+        if (items.length >= MAX_WISHES) { wishStatus($("#myStatus"), `Lista może mieć maksymalnie ${MAX_WISHES} pozycji.`, true); return null; }
+        return [...items, { t, u }];
+      }, "Zapisano ✓");
+      if (ok) { $("#wishText").value = ""; $("#wishUrl").value = ""; }
+    });
+
+    $("#myItems").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-del]");
+      if (!btn) return;
+      const target = wish.mine[+btn.dataset.del];
+      if (!target) return;
+      updateMine((items) => {
+        // Match by content so a list changed elsewhere doesn't lose the wrong item
+        const i = items.findIndex((it) => it.t === target.t && it.u === target.u);
+        return i === -1 ? items : items.filter((_, j) => j !== i);
+      }, "Usunięto ✓");
     });
 
     /* =========================================================
