@@ -436,6 +436,10 @@
     }
     .wish-status { font-size: 13px; color: var(--muted); min-height: 20px; margin-top: 6px; }
     .wish-status.err { color: var(--danger); }
+    /* Organizer: person picker */
+    .who { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+    .who-title { margin: 18px 0 0; font-size: 17px; color: var(--text); }
+    .who-title span { color: var(--gold-soft); }
 
     /* =========================================================
        TOAST
@@ -455,7 +459,6 @@
     }
     .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
-    footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 30px; opacity: .8; }
     [hidden] { display: none !important; }
 
     /* Respect users who prefer less motion */
@@ -519,6 +522,26 @@
         </div>
 
         <ul id="plist" class="plist"></ul>
+
+        <!-- Organizer wish-list editor: lists only, no pairings -->
+        <details class="tool" id="wishTool" hidden>
+          <summary>📝 Listy życzeń (dla organizatora)</summary>
+          <div class="box">
+            <p>Podgląd i edycja list życzeń — np. dla osób, które nie korzystają z telefonu. Widać tu tylko listy, nie pary.</p>
+            <div class="who" id="orgWho"></div>
+            <div id="orgEditor" hidden>
+              <h3 class="who-title">Lista: <span id="orgWhoName"></span></h3>
+              <ul class="wish-items" id="orgItems"></ul>
+              <p class="wish-empty" id="orgEmpty" hidden>Ta lista jest jeszcze pusta.</p>
+              <form class="wish-form" id="orgForm" autocomplete="off">
+                <input id="orgText" type="text" maxlength="200" placeholder="np. książka – kryminał" aria-label="Pomysł na prezent" required />
+                <input id="orgUrl" type="text" maxlength="300" placeholder="Link do sklepu (opcjonalnie)" aria-label="Link do sklepu (opcjonalnie)" inputmode="url" />
+                <button class="btn gold" type="submit" id="orgAdd">➕ Dodaj do listy</button>
+              </form>
+              <div class="wish-status" id="orgStatus"></div>
+            </div>
+          </div>
+        </details>
 
         <!-- Organizer-only pairings preview: hidden until explicitly requested -->
         <details class="tool" id="pairsTool">
@@ -615,8 +638,6 @@
         <a class="btn" href="./">Przejdź do strony organizatora</a>
       </section>
     </main>
-
-    <footer>Działa w całości w Twojej przeglądarce — bez kont i bez bazy danych.</footer>
   </div>
 
   <!-- Draw animation overlay -->
@@ -1037,6 +1058,7 @@
         </li>`).join("");
 
       loadWishCounts(state);
+      renderOrgWishTool(state);
     }
 
     /** Show how many items each person has on their wish list (counts only, never contents). */
@@ -1182,7 +1204,7 @@
        too (read). Security rules forbid listing documents, so a
        list can't be found without its key.
        ========================================================= */
-    const wish = { myKey: null, theirKey: null, mine: [], busy: false };
+    const wish = { myKey: null, theirKey: null };
 
     const wishUrl = (key) =>
       `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/wishlists/${key}`;
@@ -1258,23 +1280,11 @@
       $("#myWish").hidden = !wish.myKey;
       $("#theirWish").hidden = true; // shown after the card is revealed
       $("#theirName").textContent = data.r;
-      $("#wishText").value = "";
-      $("#wishUrl").value = "";
-      $("#myItems").innerHTML = $("#theirItems").innerHTML = "";
-      $("#myEmpty").hidden = $("#theirEmpty").hidden = true;
-      if (wish.myKey) loadMine();
+      $("#theirItems").innerHTML = "";
+      $("#theirEmpty").hidden = true;
+      if (wish.myKey) myEditor.load(wish.myKey);
+      else myEditor.reset();
       if (wish.theirKey) loadTheirs();
-    }
-
-    async function loadMine() {
-      wishStatus($("#myStatus"), "Wczytywanie…");
-      try {
-        wish.mine = await fetchWishes(wish.myKey);
-        renderWishItems($("#myItems"), $("#myEmpty"), wish.mine, true);
-        wishStatus($("#myStatus"), "");
-      } catch {
-        wishStatus($("#myStatus"), OFFLINE_MSG, true);
-      }
     }
 
     async function loadTheirs() {
@@ -1289,53 +1299,142 @@
     }
     $("#theirRefresh").addEventListener("click", loadTheirs);
 
-    /** Re-read the latest list first (it may have been edited on another device), apply the change, save. */
-    async function updateMine(change, okMsg) {
-      if (wish.busy) return false;
-      wish.busy = true;
-      $("#wishAdd").disabled = true;
-      wishStatus($("#myStatus"), "Zapisywanie…");
-      try {
-        const next = change(await fetchWishes(wish.myKey));
-        if (!next) return false;
-        await saveWishes(wish.myKey, next);
-        wish.mine = next;
-        renderWishItems($("#myItems"), $("#myEmpty"), wish.mine, true);
-        wishStatus($("#myStatus"), okMsg);
-        return true;
-      } catch {
-        wishStatus($("#myStatus"), "Nie udało się zapisać. Sprawdź internet i spróbuj ponownie.", true);
-        return false;
-      } finally {
-        wish.busy = false;
-        $("#wishAdd").disabled = false;
+    /**
+     * An editable wish list (add / delete) bound to a set of elements.
+     * Used for a participant's own list and for the organizer's editor.
+     * `onSaved(items)` runs after each successful save.
+     */
+    function makeWishEditor({ ul, empty, status, form, text, url, addBtn, onSaved = () => {} }) {
+      const ed = { key: null, items: [], busy: false };
+
+      ed.reset = () => {
+        ed.key = null; ed.items = [];
+        ul.innerHTML = ""; empty.hidden = true;
+        text.value = ""; url.value = "";
+        wishStatus(status, "");
+      };
+
+      ed.load = async (key) => {
+        ed.reset();
+        ed.key = key;
+        wishStatus(status, "Wczytywanie…");
+        try {
+          const items = await fetchWishes(key);
+          if (ed.key !== key) return; // switched to another list meanwhile
+          ed.items = items;
+          renderWishItems(ul, empty, items, true);
+          wishStatus(status, "");
+        } catch {
+          if (ed.key === key) wishStatus(status, OFFLINE_MSG, true);
+        }
+      };
+
+      /** Re-read the latest list first (it may have been edited on another device), apply the change, save. */
+      async function update(change, okMsg) {
+        if (ed.busy || !ed.key) return false;
+        const key = ed.key;
+        ed.busy = true;
+        addBtn.disabled = true;
+        wishStatus(status, "Zapisywanie…");
+        try {
+          const next = change(await fetchWishes(key));
+          if (!next) return false;
+          await saveWishes(key, next);
+          if (ed.key === key) {
+            ed.items = next;
+            renderWishItems(ul, empty, next, true);
+            wishStatus(status, okMsg);
+          }
+          onSaved(next, key);
+          return true;
+        } catch {
+          wishStatus(status, "Nie udało się zapisać. Sprawdź internet i spróbuj ponownie.", true);
+          return false;
+        } finally {
+          ed.busy = false;
+          addBtn.disabled = false;
+        }
       }
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const t = text.value.trim().slice(0, 200);
+        const u = normalizeUrl(url.value);
+        if (!t) return;
+        if (u === null) { wishStatus(status, "Ten link wygląda na niepoprawny — sprawdź go albo zostaw pole puste.", true); return; }
+        const ok = await update((items) => {
+          if (items.length >= MAX_WISHES) { wishStatus(status, `Lista może mieć maksymalnie ${MAX_WISHES} pozycji.`, true); return null; }
+          return [...items, { t, u }];
+        }, "Zapisano ✓");
+        if (ok) { text.value = ""; url.value = ""; }
+      });
+
+      ul.addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-del]");
+        if (!btn) return;
+        const target = ed.items[+btn.dataset.del];
+        if (!target) return;
+        update((items) => {
+          // Match by content so a list changed elsewhere doesn't lose the wrong item
+          const i = items.findIndex((it) => it.t === target.t && it.u === target.u);
+          return i === -1 ? items : items.filter((_, j) => j !== i);
+        }, "Usunięto ✓");
+      });
+
+      return ed;
     }
 
-    $("#wishForm").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const t = $("#wishText").value.trim().slice(0, 200);
-      const u = normalizeUrl($("#wishUrl").value);
-      if (!t) return;
-      if (u === null) { wishStatus($("#myStatus"), "Ten link wygląda na niepoprawny — sprawdź go albo zostaw pole puste.", true); return; }
-      const ok = await updateMine((items) => {
-        if (items.length >= MAX_WISHES) { wishStatus($("#myStatus"), `Lista może mieć maksymalnie ${MAX_WISHES} pozycji.`, true); return null; }
-        return [...items, { t, u }];
-      }, "Zapisano ✓");
-      if (ok) { $("#wishText").value = ""; $("#wishUrl").value = ""; }
+    // Participant's own list
+    const myEditor = makeWishEditor({
+      ul: $("#myItems"), empty: $("#myEmpty"), status: $("#myStatus"),
+      form: $("#wishForm"), text: $("#wishText"), url: $("#wishUrl"), addBtn: $("#wishAdd"),
     });
 
-    $("#myItems").addEventListener("click", (e) => {
-      const btn = e.target.closest("button[data-del]");
-      if (!btn) return;
-      const target = wish.mine[+btn.dataset.del];
-      if (!target) return;
-      updateMine((items) => {
-        // Match by content so a list changed elsewhere doesn't lose the wrong item
-        const i = items.findIndex((it) => it.t === target.t && it.u === target.u);
-        return i === -1 ? items : items.filter((_, j) => j !== i);
-      }, "Usunięto ✓");
+    /* ---------------------------------------------------------
+       ORGANIZER WISH-LIST EDITOR
+       Pick a person, then view / add / delete their items.
+       Shows lists only — never who is buying for whom.
+       --------------------------------------------------------- */
+    const orgEditor = makeWishEditor({
+      ul: $("#orgItems"), empty: $("#orgEmpty"), status: $("#orgStatus"),
+      form: $("#orgForm"), text: $("#orgText"), url: $("#orgUrl"), addBtn: $("#orgAdd"),
+      onSaved: (items, key) => {
+        // Keep the count under that person's name in sync
+        const s = loadState();
+        const i = s?.participants.findIndex((p) => { try { return decodePayload(p.token).k === key; } catch { return false; } });
+        const el = i >= 0 && document.querySelector(`[data-wish="${i}"]`);
+        if (el) el.textContent = items.length ? `📝 Lista życzeń: ${pozycje(items.length)}` : "📝 Lista życzeń: jeszcze pusta";
+      },
     });
+
+    function renderOrgWishTool(state) {
+      const canEdit = WISHLISTS_ENABLED && state.participants.some((p) => { try { return !!decodePayload(p.token).k; } catch { return false; } });
+      $("#wishTool").hidden = !canEdit;
+      $("#orgWho").innerHTML = state.participants
+        .map((p, i) => `<button class="btn small" type="button" data-who="${i}">${escapeHtml(p.name)}</button>`).join("");
+      closeOrgEditor();
+    }
+
+    function closeOrgEditor() {
+      orgEditor.reset();
+      $("#orgEditor").hidden = true;
+      document.querySelectorAll("#orgWho button").forEach((b) => b.classList.remove("gold"));
+    }
+
+    $("#orgWho").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-who]");
+      if (!btn) return;
+      const p = loadState()?.participants[+btn.dataset.who];
+      let key;
+      try { key = decodePayload(p.token).k; } catch { /* old link without a wish list */ }
+      document.querySelectorAll("#orgWho button").forEach((b) => b.classList.toggle("gold", b === btn));
+      $("#orgEditor").hidden = false;
+      $("#orgWhoName").textContent = p.name;
+      if (key) orgEditor.load(key);
+      else { orgEditor.reset(); wishStatus($("#orgStatus"), "Ta osoba nie ma listy życzeń w swoim linku.", true); }
+    });
+
+    $("#wishTool").addEventListener("toggle", (e) => { if (!e.target.open) closeOrgEditor(); });
 
     /* =========================================================
        EFFECTS: confetti + snowfall
